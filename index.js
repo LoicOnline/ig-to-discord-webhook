@@ -1,3 +1,7 @@
+// index.js — Instagram RSS (RSS.app) -> Discord Webhook (avec mention rôle)
+// Anti-doublons persistants via Upstash Redis
+// Option C activée: au premier run, poste UNE FOIS le dernier post puis mémorise l'état.
+
 import axios from "axios";
 import Parser from "rss-parser";
 
@@ -16,10 +20,13 @@ if (!WEBHOOK || !RSS_URL) {
   process.exit(1);
 }
 if (!UPSTASH_URL || !UPSTASH_TOKEN) {
-  console.error("Missing env vars: UPSTASH_REDIS_REST_URL and/or UPSTASH_REDIS_REST_TOKEN");
+  console.error(
+    "Missing env vars: UPSTASH_REDIS_REST_URL and/or UPSTASH_REDIS_REST_TOKEN"
+  );
   process.exit(1);
 }
 
+// Une clé par "source" pour éviter les collisions si tu ajoutes d'autres feeds plus tard
 const STATE_KEY = process.env.STATE_KEY || "ig:lastGuid:eva_savignyletemple";
 
 function extractGuid(item) {
@@ -28,40 +35,50 @@ function extractGuid(item) {
 
 async function redisGet(key) {
   const res = await axios.get(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    timeout: 15000,
   });
   return res.data?.result ?? null;
 }
 
 async function redisSet(key, value) {
-  await axios.post(`${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`, null, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
-  });
+  await axios.post(
+    `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`,
+    null,
+    {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+      timeout: 15000,
+    }
+  );
 }
 
 async function postToDiscord(link) {
-  const content =
-`${ROLE_MENTION}
+  const content = `${ROLE_MENTION}
 
 **EVA SAVIGNY LE TEMPLE** vient de faire un **NOUVEAU POST** sur **INSTAGRAM** !!
 Va mettre un **LIKE** et **PARTAGE EN STORY** → ${link}`;
 
-  // IMPORTANT : on autorise uniquement la mention du rôle donné
+  // Sécurise les mentions : on autorise uniquement la mention du rôle fourni
   const roleIds = ROLE_MENTION.match(/\d+/g) || [];
 
-  await axios.post(WEBHOOK, {
-    content,
-    allowed_mentions: {
-      parse: [],
-      roles: roleIds
-    }
-  });
+  await axios.post(
+    WEBHOOK,
+    {
+      content,
+      allowed_mentions: {
+        parse: [],
+        roles: roleIds,
+      },
+    },
+    { timeout: 15000 }
+  );
 }
 
 async function tick() {
   try {
     const feed = await parser.parseURL(RSS_URL);
     const items = feed.items ?? [];
+
     if (!items.length) {
       console.log("No items in RSS.");
       return;
@@ -70,19 +87,26 @@ async function tick() {
     // RSS.app : généralement le plus récent d'abord
     const latest = items[0];
     const guid = extractGuid(latest);
-    const link = latest.link;
+    const link = latest.link || "(lien indisponible)";
 
     if (!guid) {
-      console.log("Latest item has no guid/id/link/title usable as guid.");
+      console.log(
+        "Latest item has no guid/id/link/title usable as guid. Title:",
+        latest?.title
+      );
       return;
     }
 
     const lastGuid = await redisGet(STATE_KEY);
 
+    // ✅ Option C : au premier run, on annonce UNE FOIS puis on mémorise.
     if (!lastGuid) {
-      // Premier run (ou state perdu) : on initialise SANS poster pour éviter un spam.
+      await postToDiscord(link);
       await redisSet(STATE_KEY, guid);
-      console.log("Initialized state. lastGuid =", guid);
+      console.log(
+        "First run: posted latest and initialized state. lastGuid =",
+        guid
+      );
       return;
     }
 
@@ -92,15 +116,22 @@ async function tick() {
     }
 
     // Nouveau post détecté → on poste puis on met à jour l'état
-    await postToDiscord(link || "(lien indisponible)");
+    await postToDiscord(link);
     await redisSet(STATE_KEY, guid);
 
     console.log("Posted new IG item:", link, "guid:", guid);
   } catch (err) {
-    console.error("Tick error:", err?.response?.data || err?.message || err);
+    // Affiche aussi les réponses HTTP utiles (Discord, Upstash, etc.)
+    const details = err?.response?.data
+      ? JSON.stringify(err.response.data)
+      : err?.message || String(err);
+    console.error("Tick error:", details);
   }
 }
 
-console.log(`Started. Checking every ${CHECK_HOURS} hour(s). STATE_KEY=${STATE_KEY}`);
+console.log(
+  `Started. Checking every ${CHECK_HOURS} hour(s). STATE_KEY=${STATE_KEY}`
+);
+
 tick();
 setInterval(tick, CHECK_HOURS * 60 * 60 * 1000);
