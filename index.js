@@ -130,8 +130,8 @@ async function tick() {
 }
 
 console.log(
-  `Started. Checking every ${CHECK_HOURS} hour(s). STATE_KEY=${STATE_KEY}`
+  `Started. Checking every ${CHECK_MINUTES} minute(s). STATE_KEY=${STATE_KEY}`
 );
 
 tick();
-setInterval(tick, CHECK_HOURS * 60 * 60 * 1000);
+setInterval(tick, CHECK_MINUTES * 60 * 1000);
