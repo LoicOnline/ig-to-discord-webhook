@@ -10,7 +10,7 @@ const parser = new Parser();
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const RSS_URL = process.env.RSS_URL;
 const ROLE_MENTION = process.env.ROLE_MENTION || "";
-const CHECK_HOURS = Number(process.env.CHECK_HOURS || 12);
+const CHECK_MINUTES = Number(process.env.CHECK_MINUTES || 5);
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
