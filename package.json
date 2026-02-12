@@ -1,6 +1,13 @@
 {
-  "name": "ig-discord",
+  "name": "ig-to-discord-webhook",
   "version": "1.0.0",
+  "main": "index.js",
   "type": "module",
-  "dependencies": { "axios": "^1.7.9" }
+  "scripts": {
+    "start": "node index.js",
+    "poll": "node index.js --once"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.4.1"
+  }
 }
