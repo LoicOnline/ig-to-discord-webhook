@@ -1,41 +1,24 @@
-// index.js — Instagram RSS (RSS.app) -> Discord Webhook
-// - Mentions a specific role
-// - No duplicates across restarts (Upstash Redis)
-// - Checks every CHECK_MINUTES
-// - Fetches RSS via Axios (so we can see status/url and avoid rss-parser's internal fetch)
-// - "Option C": on first run, posts the latest item once, then stores state
-
+import express from "express";
 import axios from "axios";
-import Parser from "rss-parser";
 
-const parser = new Parser();
+const app = express();
+app.use(express.json({ limit: "1mb" }));
 
-const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
-const RSS_URL = process.env.RSS_URL;
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const ROLE_MENTION = process.env.ROLE_MENTION || "";
-
-// ✅ Use minutes (recommended: 10 to avoid RSS.app 402)
-const CHECK_MINUTES = Number(process.env.CHECK_MINUTES || 10);
+const APIFY_TOKEN = process.env.APIFY_TOKEN;
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const STATE_KEY = process.env.STATE_KEY || "ig:last3:eva_savignyletemple";
 
-if (!WEBHOOK || !RSS_URL) {
-  console.error("Missing env vars: DISCORD_WEBHOOK_URL and/or RSS_URL");
-  process.exit(1);
-}
-if (!UPSTASH_URL || !UPSTASH_TOKEN) {
-  console.error(
-    "Missing env vars: UPSTASH_REDIS_REST_URL and/or UPSTASH_REDIS_REST_TOKEN"
-  );
+if (!DISCORD_WEBHOOK_URL || !APIFY_TOKEN || !UPSTASH_URL || !UPSTASH_TOKEN) {
+  console.error("Missing env vars. Need DISCORD_WEBHOOK_URL, APIFY_TOKEN, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN");
   process.exit(1);
 }
 
-const STATE_KEY =
-  process.env.STATE_KEY || "ig:lastGuid:eva_savignyletemple";
-
-function extractGuid(item) {
-  return item?.guid || item?.id || item?.link || item?.title || null;
+function roleIdsFromMention(mention) {
+  return mention.match(/\d+/g) || [];
 }
 
 async function redisGet(key) {
@@ -50,113 +33,133 @@ async function redisSet(key, value) {
   await axios.post(
     `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`,
     null,
-    {
-      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-      timeout: 15000
-    }
+    { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, timeout: 15000 }
   );
 }
 
-async function postToDiscord(link) {
+async function postDiscord(link) {
   const content = `${ROLE_MENTION}
 
 **EVA SAVIGNY LE TEMPLE** vient de faire un **NOUVEAU POST** sur **INSTAGRAM** !!
 Va mettre un **LIKE** et **PARTAGE EN STORY** → ${link}`;
 
-  // Allow only the configured role mention (prevents abuse)
-  const roleIds = ROLE_MENTION.match(/\d+/g) || [];
-
   await axios.post(
-    WEBHOOK,
+    DISCORD_WEBHOOK_URL,
     {
       content,
-      allowed_mentions: { parse: [], roles: roleIds }
+      allowed_mentions: { parse: [], roles: roleIdsFromMention(ROLE_MENTION) }
     },
     { timeout: 15000 }
   );
 }
 
-async function fetchRssXml(url) {
-  // RSS.app can be picky; this UA sometimes helps.
-  // If RSS.app returns 402, you'll see it in the catch with status/url.
-  const resp = await axios.get(url, {
-    timeout: 20000,
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (compatible; ig-to-discord-webhook/1.0; +https://railway.app)",
-      "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7"
-    },
-    // some services respond differently based on redirects; axios follows by default
-    maxRedirects: 5,
-    validateStatus: (s) => s >= 200 && s < 300 // throw on non-2xx so we can log it
-  });
-
-  return resp.data;
+// Robustly extract runId from Apify webhook payload
+function extractRunId(payload) {
+  return (
+    payload?.resource?.id ||
+    payload?.data?.actorRunId ||
+    payload?.eventData?.actorRunId ||
+    payload?.eventData?.resourceId ||
+    payload?.resourceId ||
+    null
+  );
 }
 
-async function tick() {
+async function getRun(runId) {
+  // Apify "Get run" endpoint
+  const url = `https://api.apify.com/v2/actor-runs/${encodeURIComponent(runId)}?token=${encodeURIComponent(APIFY_TOKEN)}`;
+  const res = await axios.get(url, { timeout: 20000 });
+  return res.data?.data;
+}
+
+async function getLatestDatasetItems(datasetId, limit = 3) {
+  // Apify "Get dataset items" endpoint, newest first
+  const url =
+    `https://api.apify.com/v2/datasets/${encodeURIComponent(datasetId)}/items` +
+    `?clean=true&desc=1&limit=${limit}&token=${encodeURIComponent(APIFY_TOKEN)}`;
+
+  const res = await axios.get(url, { timeout: 30000 });
+  // When format=json (default), Apify returns array of items for /items
+  return Array.isArray(res.data) ? res.data : [];
+}
+
+function extractPostIdAndLink(item) {
+  // Different actors output different fields; try common ones
+  const id =
+    item?.id ||
+    item?.shortCode ||
+    item?.code ||
+    item?.postId ||
+    item?.url ||
+    item?.link ||
+    null;
+
+  const link =
+    item?.url ||
+    item?.link ||
+    item?.postUrl ||
+    (item?.shortCode ? `https://www.instagram.com/p/${item.shortCode}/` : null) ||
+    "(lien indisponible)";
+
+  return { id, link };
+}
+
+app.post("/apify-webhook", async (req, res) => {
   try {
-    console.log("Check executed at", new Date().toISOString());
+    const payload = req.body;
+    const runId = extractRunId(payload);
 
-    // 1) Fetch RSS as XML (so we can capture HTTP status/errors)
-    const xml = await fetchRssXml(RSS_URL);
-
-    // 2) Parse XML
-    const feed = await parser.parseString(xml);
-    const items = feed.items ?? [];
-
-    if (!items.length) {
-      console.log("No items in RSS.");
-      return;
+    if (!runId) {
+      console.error("Webhook received but runId not found in payload keys.");
+      return res.status(400).send("Missing runId");
     }
 
-    // RSS.app typically returns newest first
-    const latest = items[0];
-    const guid = extractGuid(latest);
-    const link = latest.link || "(lien indisponible)";
+    const run = await getRun(runId);
+    const datasetId = run?.defaultDatasetId;
 
-    if (!guid) {
-      console.log("Latest item has no usable guid/id/link/title.", {
-        title: latest?.title
-      });
-      return;
+    if (!datasetId) {
+      console.error("Run has no defaultDatasetId", { runId });
+      return res.status(400).send("Missing defaultDatasetId");
     }
 
-    const lastGuid = await redisGet(STATE_KEY);
+    const items = await getLatestDatasetItems(datasetId, 3);
 
-    // ✅ Option C: On first run, post the latest once, then store state
-    if (!lastGuid) {
-      await postToDiscord(link);
-      await redisSet(STATE_KEY, guid);
-      console.log("First run: posted latest and initialized state.", { guid });
-      return;
+    // Load previously seen IDs set
+    const prevRaw = await redisGet(STATE_KEY);
+    const prevIds = new Set(prevRaw ? JSON.parse(prevRaw) : []);
+
+    // Build new IDs from latest 3 items
+    const latest = items
+      .map(extractPostIdAndLink)
+      .filter(x => x.id);
+
+    // Post any item not previously seen (from oldest->newest to keep order)
+    const toPost = latest.filter(x => !prevIds.has(x.id)).reverse();
+
+    for (const p of toPost) {
+      await postDiscord(p.link);
+      console.log("Posted to Discord:", p.link);
     }
 
-    if (guid === lastGuid) {
-      console.log("No new post.", { lastGuid });
-      return;
-    }
+    // Save the latest 3 IDs (current state) to prevent duplicates
+    const latestIds = latest.slice(0, 3).map(x => x.id);
+    await redisSet(STATE_KEY, JSON.stringify(latestIds));
 
-    await postToDiscord(link);
-    await redisSet(STATE_KEY, guid);
-    console.log("Posted new IG item.", { link, guid });
+    res.status(200).send("OK");
   } catch (err) {
     const status = err?.response?.status;
     const url = err?.config?.url;
-    const data = err?.response?.data;
-
-    console.error("Tick error:", {
+    console.error("Handler error:", {
       status,
       url,
-      data: typeof data === "string" ? data.slice(0, 300) : data,
-      message: err?.message
+      message: err?.message,
+      data: err?.response?.data
     });
+    res.status(500).send("Error");
   }
-}
+});
 
-console.log(
-  `Started. Checking every ${CHECK_MINUTES} minute(s). STATE_KEY=${STATE_KEY}`
-);
+app.get("/", (_, res) => res.send("OK"));
 
-tick();
-setInterval(tick, CHECK_MINUTES * 60 * 1000);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Listening on", PORT));
