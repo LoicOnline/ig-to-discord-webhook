@@ -5,12 +5,18 @@ on:
     - cron: "*/30 * * * *"   # toutes les 30 minutes
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v4
