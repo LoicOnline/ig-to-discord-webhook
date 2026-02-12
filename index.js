@@ -120,13 +120,16 @@ async function tick() {
     await redisSet(STATE_KEY, guid);
 
     console.log("Posted new IG item:", link, "guid:", guid);
-  } catch (err) {
-    // Affiche aussi les réponses HTTP utiles (Discord, Upstash, etc.)
-    const details = err?.response?.data
-      ? JSON.stringify(err.response.data)
-      : err?.message || String(err);
-    console.error("Tick error:", details);
-  }
+} catch (err) {
+  const status = err?.response?.status;
+  const url = err?.config?.url;
+  const data = err?.response?.data;
+
+  console.error("Tick error:", {
+    status,
+    url,
+    data: typeof data === "string" ? data.slice(0, 200) : data
+  });
 }
 
 console.log(
