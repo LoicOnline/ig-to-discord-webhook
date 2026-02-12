@@ -41,48 +41,110 @@ Va mettre un **LIKE** et **PARTAGE EN STORY** → ${link}`,
   );
 }
 
-// ✅ New method (more robust than ?__a=1)
-async function getLastPosts() {
+// --- Method A: Try Instagram web_profile_info (may be blocked on GitHub Actions) ---
+async function getLastPostsViaWebProfileInfo() {
   const url = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(
     INSTAGRAM_USERNAME
   )}`;
 
   const res = await axios.get(url, {
     timeout: 20000,
-    maxRedirects: 0,
     validateStatus: () => true,
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
       "Accept": "application/json,text/plain,*/*",
-      "X-IG-App-ID": "936619743392459", // common web app id
+      "X-IG-App-ID": "936619743392459",
       "X-Requested-With": "XMLHttpRequest",
       "Referer": `https://www.instagram.com/${INSTAGRAM_USERNAME}/`
     }
   });
 
-  console.log("IG fetch status:", res.status);
+  console.log("IG API status:", res.status);
 
-  // If IG blocks, you'll see 302/403/429 or HTML
   if (res.status !== 200 || typeof res.data !== "object") {
-    const snippet =
-      typeof res.data === "string" ? res.data.slice(0, 200) : JSON.stringify(res.data).slice(0, 200);
-    throw new Error(`Instagram blocked or changed response. status=${res.status} snippet=${snippet}`);
+    throw new Error(`IG API blocked. status=${res.status}`);
   }
 
   const edges =
     res.data?.data?.user?.edge_owner_to_timeline_media?.edges || [];
 
-  const posts = edges.slice(0, CHECK_LIMIT).map((edge) => {
-    const shortcode = edge?.node?.shortcode;
-    const id = edge?.node?.id || shortcode;
-    return {
-      id,
-      link: shortcode ? `https://www.instagram.com/p/${shortcode}/` : null
-    };
-  }).filter(p => p.id && p.link);
+  const posts = edges
+    .slice(0, CHECK_LIMIT)
+    .map((edge) => {
+      const shortcode = edge?.node?.shortcode;
+      const id = edge?.node?.id || shortcode;
+      return shortcode
+        ? { id, link: `https://www.instagram.com/p/${shortcode}/` }
+        : null;
+    })
+    .filter(Boolean);
 
-  console.log("Fetched links:", posts.map(p => p.link));
   return posts;
+}
+
+// --- Method B: Fallback via r.jina.ai proxy, parse HTML text for /p/<shortcode>/ ---
+async function getLastPostsViaJinaProxy() {
+  const profileUrl = `https://www.instagram.com/${INSTAGRAM_USERNAME}/`;
+  const jinaUrl = `https://r.jina.ai/http://${profileUrl.replace(/^https?:\/\//, "")}`;
+
+  const res = await axios.get(jinaUrl, {
+    timeout: 30000,
+    validateStatus: () => true,
+    headers: { "User-Agent": "Mozilla/5.0" }
+  });
+
+  console.log("Jina proxy status:", res.status);
+
+  if (res.status < 200 || res.status >= 300 || typeof res.data !== "string") {
+    throw new Error(`Jina fetch failed. status=${res.status}`);
+  }
+
+  // Extract unique shortcodes in order of appearance
+  const re = /https?:\/\/www\.instagram\.com\/p\/([A-Za-z0-9_-]+)\//g;
+  const seen = new Set();
+  const posts = [];
+
+  let match;
+  while ((match = re.exec(res.data)) !== null) {
+    const sc = match[1];
+    if (!seen.has(sc)) {
+      seen.add(sc);
+      posts.push({ id: sc, link: `https://www.instagram.com/p/${sc}/` });
+      if (posts.length >= CHECK_LIMIT) break;
+    }
+  }
+
+  if (!posts.length) {
+    // Sometimes links are relative; try that too
+    const re2 = /\/p\/([A-Za-z0-9_-]+)\//g;
+    while ((match = re2.exec(res.data)) !== null) {
+      const sc = match[1];
+      if (!seen.has(sc)) {
+        seen.add(sc);
+        posts.push({ id: sc, link: `https://www.instagram.com/p/${sc}/` });
+        if (posts.length >= CHECK_LIMIT) break;
+      }
+    }
+  }
+
+  if (!posts.length) {
+    throw new Error("Could not extract any /p/<shortcode>/ links from HTML.");
+  }
+
+  return posts;
+}
+
+async function getLastPosts() {
+  try {
+    const posts = await getLastPostsViaWebProfileInfo();
+    console.log("Fetched via IG API:", posts.map(p => p.link));
+    return posts;
+  } catch (e) {
+    console.log("IG API failed, fallback to Jina proxy. Reason:", e.message);
+    const posts = await getLastPostsViaJinaProxy();
+    console.log("Fetched via Jina:", posts.map(p => p.link));
+    return posts;
+  }
 }
 
 async function main() {
