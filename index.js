@@ -1,3 +1,9 @@
+// index.js — GitHub Actions friendly IG -> Discord
+// - Runs every 30 min (via workflow)
+// - Tries IG "web_profile_info" (often rate-limited on GitHub runners)
+// - Fallback: fetches profile page via r.jina.ai proxy and extracts post shortcodes
+// - Anti-duplicates stored in state.json committed back to repo
+
 import axios from "axios";
 import fs from "fs";
 
@@ -41,7 +47,7 @@ Va mettre un **LIKE** et **PARTAGE EN STORY** → ${link}`,
   );
 }
 
-// --- Method A: Try Instagram web_profile_info (may be blocked on GitHub Actions) ---
+// --- Method A: IG web_profile_info (can be rate-limited on GitHub Actions) ---
 async function getLastPostsViaWebProfileInfo() {
   const url = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(
     INSTAGRAM_USERNAME
@@ -79,13 +85,15 @@ async function getLastPostsViaWebProfileInfo() {
     })
     .filter(Boolean);
 
+  if (!posts.length) throw new Error("IG API returned 0 posts.");
+
   return posts;
 }
 
-// --- Method B: Fallback via r.jina.ai proxy, parse HTML text for /p/<shortcode>/ ---
+// --- Method B: Fallback via r.jina.ai proxy; extract "shortcode":"..." from HTML/embedded JSON ---
 async function getLastPostsViaJinaProxy() {
-  const profileUrl = `https://www.instagram.com/${INSTAGRAM_USERNAME}/`;
-  const jinaUrl = `https://r.jina.ai/http://${profileUrl.replace(/^https?:\/\//, "")}`;
+  // Use https directly (more reliable)
+  const jinaUrl = `https://r.jina.ai/https://www.instagram.com/${INSTAGRAM_USERNAME}/`;
 
   const res = await axios.get(jinaUrl, {
     timeout: 30000,
@@ -99,13 +107,15 @@ async function getLastPostsViaJinaProxy() {
     throw new Error(`Jina fetch failed. status=${res.status}`);
   }
 
-  // Extract unique shortcodes in order of appearance
-  const re = /https?:\/\/www\.instagram\.com\/p\/([A-Za-z0-9_-]+)\//g;
+  const text = res.data;
+
+  // 1) Primary: embedded JSON has "shortcode":"Cxxxx"
+  const reShortcode = /"shortcode":"([A-Za-z0-9_-]+)"/g;
   const seen = new Set();
   const posts = [];
-
   let match;
-  while ((match = re.exec(res.data)) !== null) {
+
+  while ((match = reShortcode.exec(text)) !== null) {
     const sc = match[1];
     if (!seen.has(sc)) {
       seen.add(sc);
@@ -114,10 +124,10 @@ async function getLastPostsViaJinaProxy() {
     }
   }
 
+  // 2) Fallback: sometimes real links /p/<shortcode>/ exist
   if (!posts.length) {
-    // Sometimes links are relative; try that too
-    const re2 = /\/p\/([A-Za-z0-9_-]+)\//g;
-    while ((match = re2.exec(res.data)) !== null) {
+    const reP = /\/p\/([A-Za-z0-9_-]+)\//g;
+    while ((match = reP.exec(text)) !== null) {
       const sc = match[1];
       if (!seen.has(sc)) {
         seen.add(sc);
@@ -128,7 +138,8 @@ async function getLastPostsViaJinaProxy() {
   }
 
   if (!posts.length) {
-    throw new Error("Could not extract any /p/<shortcode>/ links from HTML.");
+    console.log("Jina HTML snippet:", text.slice(0, 800));
+    throw new Error("Could not extract any post shortcodes from HTML.");
   }
 
   return posts;
@@ -137,12 +148,12 @@ async function getLastPostsViaJinaProxy() {
 async function getLastPosts() {
   try {
     const posts = await getLastPostsViaWebProfileInfo();
-    console.log("Fetched via IG API:", posts.map(p => p.link));
+    console.log("Fetched via IG API:", posts.map((p) => p.link));
     return posts;
   } catch (e) {
     console.log("IG API failed, fallback to Jina proxy. Reason:", e.message);
     const posts = await getLastPostsViaJinaProxy();
-    console.log("Fetched via Jina:", posts.map(p => p.link));
+    console.log("Fetched via Jina:", posts.map((p) => p.link));
     return posts;
   }
 }
@@ -152,7 +163,7 @@ async function main() {
   const sentIds = loadState();
 
   const newPosts = lastPosts.filter((p) => !sentIds.includes(p.id));
-  console.log("New posts to send:", newPosts.map(p => p.link));
+  console.log("New posts to send:", newPosts.map((p) => p.link));
 
   for (const post of newPosts.reverse()) {
     await postDiscord(post.link);
